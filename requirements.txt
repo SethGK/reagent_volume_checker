@@ -1,6 +1,7 @@
+# requirements.txt
 streamlit
 pandas
-camelot-py[cv]  # Or just camelot-py if OpenCV isn't strictly needed by flavor='stream'
-openpyxl        # Needed for pandas Excel writing/reading (.xlsx)
-# Add xlrd if you need to support older .xls files for reading
-# xlrd
+pytesseract
+Pillow
+pdf2image
+openpyxl

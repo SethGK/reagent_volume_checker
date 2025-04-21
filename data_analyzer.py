@@ -1,60 +1,120 @@
 # data_analyzer.py
 import pandas as pd
 import streamlit as st
+from datetime import date, timedelta
 
-def find_reagents_to_load(current_volumes_dict, min_volumes_df):
+# --- Analyzer Configuration ---
+# For future analyzers, add header lists in ANALYZER_HEADERS (used elsewhere)
+ANALYZER_HEADERS = {
+    "Roche e801": [
+        "Test", "Reason", "Available Tests", "Type",
+        "Pos.", "Remaining", "Lot ID", "Expiry Date"
+    ],
+    "Beckman AU5800": [
+        "Pos.", "Test Name", "R1/R2 Shots", "Onboard Remaining",
+        "RB Stability Remaining", "Cal Stability Remaining",
+        "Expiration", "Lot No.", "BTL No", "Seq.", "Comment"
+    ],
+    # Add additional analyzers and their headers here
+}
+
+# Mapping of analyzers to data field keys produced by PDF processing
+ANALYZER_FIELDS = {
+    "Roche e801": {
+        "volume_field": "remaining",
+        "available_field": "available",
+        "expiry_date_field": "expiry_date"
+    },
+    "Beckman AU5800": {
+        "volume_field": "shots",
+        "onboard_field": "onboard_remaining",
+        "expiry_date_field": "expiry_date"
+    },
+    # Add new analyzer mappings here
+}
+
+
+def find_reagents_to_load(current_data, min_volumes, analyzer):
     """
-    Compares current reagent volumes with minimum required volumes.
+    Compare OCR-extracted data to minimums and flag expiring reagents.
 
     Args:
-        current_volumes_dict (dict): Dictionary from PDF: {'reagent_name_lower': current_volume}
-        min_volumes_df (pd.DataFrame): DataFrame from Excel with index 'Reagent Name' (lowercased)
-                                        and column 'Minimum Volume'.
+        current_data (dict): { reagent_name: {fields...} }
+        min_volumes (dict):  { reagent_name: min_volume }
+        analyzer (str):      Analyzer key matching ANALYZER_FIELDS
 
     Returns:
-        pd.DataFrame: A DataFrame containing reagents to load with columns
-                      ['Reagent Name', 'Current Volume', 'Minimum Volume'].
-                      Returns an empty DataFrame if inputs are invalid or no reagents are needed.
+        pd.DataFrame: reagents needing load or expiring soon.
     """
-    if not current_volumes_dict or min_volumes_df is None or min_volumes_df.empty:
-        st.warning("Cannot perform analysis: Missing current volumes or minimum volume data.")
-        return pd.DataFrame(columns=['Reagent Name', 'Current Volume', 'Minimum Volume'])
+    # Validate analyzer support
+    cfg = ANALYZER_FIELDS.get(analyzer)
+    if cfg is None:
+        st.error(f"Unsupported analyzer: {analyzer}")
+        return pd.DataFrame()
 
-    reagents_to_load = []
-    unmatched_reagents = []
+    vol_key = cfg["volume_field"]
+    avail_key = cfg.get("available_field")
+    onboard_key = cfg.get("onboard_field")
+    expiry_key = cfg["expiry_date_field"]
 
-    # Convert min_volumes_df index (Reagent Name) to lower case if not already done
-    min_volumes_df.index = min_volumes_df.index.str.lower()
+    today = date.today()
+    soon = timedelta(days=7)
 
-    for reagent_name_lower, current_volume in current_volumes_dict.items():
-        try:
-            # Look up minimum volume using the lowercased reagent name
-            min_volume_row = min_volumes_df.loc[reagent_name_lower]
-            minimum_volume = int(min_volume_row['Minimum Volume']) # Ensure it's int
+    records = []
+    unmatched = []
 
-            if current_volume < minimum_volume:
-                # Find original capitalization from the index for display purposes
-                original_reagent_name = min_volume_row.name # This might still be lowercase if loaded that way
-                # Try to find a better capitalized version if possible (might need improvement)
-                display_name = next((idx for idx in min_volumes_df.index if idx.lower() == reagent_name_lower), reagent_name_lower)
-
-                reagents_to_load.append({
-                    'Reagent Name': display_name.title(), # Capitalize for display
-                    'Current Volume': current_volume,
-                    'Minimum Volume': minimum_volume
-                })
-        except KeyError:
-            # Reagent found in PDF but not in the minimums list for this analyzer
-            unmatched_reagents.append(reagent_name_lower)
-        except (TypeError, ValueError) as e:
-            st.warning(f"Data type error for reagent '{reagent_name_lower}': {e}. Skipping.")
+    for name, fields in current_data.items():
+        # Fetch current volume
+        current_vol = fields.get(vol_key)
+        if current_vol is None:
             continue
 
-    if unmatched_reagents:
-        st.info(f"Note: The following reagents were found in the PDF but not in the minimums list "
-                f"for the selected analyzer: {', '.join(unmatched_reagents)}")
+        # Lookup min volume
+        min_vol = min_volumes.get(name)
+        if min_vol is None:
+            unmatched.append(name)
+            continue
 
-    if not reagents_to_load:
-        return pd.DataFrame(columns=['Reagent Name', 'Current Volume', 'Minimum Volume'])
-    else:
-        return pd.DataFrame(reagents_to_load)
+        # Check expiry
+        expiry = fields.get(expiry_key)
+        expires_soon = False
+        if isinstance(expiry, date):
+            expires_soon = (expiry - today) <= soon
+
+        # Determine if reagent needs loading or is expiring
+        if current_vol <= min_vol or expires_soon:
+            rec = {
+                "Reagent Name": name.title(),
+                "Current Volume": current_vol,
+                "Minimum Volume": min_vol,
+                "Expiry Date": expiry,
+                "Expires Within 7 Days": expires_soon
+            }
+            if avail_key and avail_key in fields:
+                rec["Available Tests"] = fields.get(avail_key)
+            if onboard_key and onboard_key in fields:
+                rec["Onboard Remaining"] = fields.get(onboard_key)
+
+            records.append(rec)
+
+    # Notify about unmatched
+    if unmatched:
+        st.info(
+            "Reagents in PDF not found in min-volumes list: " + ", ".join(unmatched)
+        )
+
+    # Build result DataFrame with consistent columns
+    cols = [
+        "Reagent Name", "Current Volume", "Minimum Volume",
+        "Available Tests", "Onboard Remaining",
+        "Expiry Date", "Expires Within 7 Days"
+    ]
+    if not records:
+        return pd.DataFrame(columns=cols)
+
+    df = pd.DataFrame(records)
+    # Ensure all columns present
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    return df[cols]

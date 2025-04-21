@@ -3,54 +3,87 @@ import pandas as pd
 import streamlit as st
 from io import BytesIO
 
-@st.cache_data(ttl=3600) # Cache data for 1 hour
-def load_min_volumes(uploaded_excel_file):
+@st.cache_data(ttl=3600)
+def load_min_volumes_by_module(uploaded_excel_file):
     """
-    Loads minimum reagent volumes from an uploaded Excel file.
-    Assumes each sheet name corresponds to an analyzer.
-    Assumes columns 'Reagent Name' and 'Minimum Volume'.
-
-    Args:
-        uploaded_excel_file: The uploaded file object from Streamlit.
+    Reads an Excel file where each sheet is a module (e.g. AU1-1, AU1-2) containing
+    'Reagent Name' and 'Minimum Volume'.
 
     Returns:
-        A dictionary where keys are analyzer names (sheet names)
-        and values are pandas DataFrames with 'Reagent Name' and 'Minimum Volume'.
-        Returns None if the file cannot be processed.
+        dict: { sheet_name: { reagent_name: min_volume (int) } }
     """
     if uploaded_excel_file is None:
-        return None
+        return {}
 
+    # Read into a BytesIO buffer for caching
+    file_buffer = BytesIO(uploaded_excel_file.getvalue())
     try:
-        # Read the file into memory (needed for caching with uploaded files)
-        file_content = BytesIO(uploaded_excel_file.getvalue())
-        excel_data = pd.ExcelFile(file_content)
-        analyzer_sheets = excel_data.sheet_names
-
-        min_volumes_dict = {}
-        required_columns = ['Reagent Name', 'Minimum Volume']
-
-        for sheet in analyzer_sheets:
-            df = excel_data.parse(sheet_name=sheet)
-            # Basic validation: Check if required columns exist
-            if all(col in df.columns for col in required_columns):
-                 # Ensure volume is numeric, drop rows where it's not
-                df['Minimum Volume'] = pd.to_numeric(df['Minimum Volume'], errors='coerce')
-                df.dropna(subset=['Minimum Volume', 'Reagent Name'], inplace=True)
-                df['Minimum Volume'] = df['Minimum Volume'].astype(int)
-                # Standardize reagent names (lowercase, strip whitespace) for matching
-                df['Reagent Name'] = df['Reagent Name'].astype(str).str.strip().str.lower()
-                min_volumes_dict[sheet] = df[['Reagent Name', 'Minimum Volume']].set_index('Reagent Name')
-            else:
-                st.warning(f"Sheet '{sheet}' in Excel file is missing required columns "
-                           f"({', '.join(required_columns)}). Skipping this sheet.")
-
-        if not min_volumes_dict:
-            st.error("No valid sheets found in the Excel file with columns 'Reagent Name' and 'Minimum Volume'.")
-            return None
-
-        return min_volumes_dict
-
+        xls = pd.ExcelFile(file_buffer)
     except Exception as e:
-        st.error(f"Error processing Excel file: {e}")
-        return None
+        st.error(f"Failed to read Excel file: {e}")
+        return {}
+
+    modules = {}
+    for sheet in xls.sheet_names:
+        try:
+            df = xls.parse(sheet_name=sheet)
+        except Exception as e:
+            st.warning(f"Could not parse sheet '{sheet}': {e}")
+            continue
+
+        # Normalize column names
+        df.columns = (
+            df.columns
+              .str.strip()
+              .str.lower()
+              .str.replace(' ', '_')
+        )
+
+        # Identify required columns
+        reagent_col = next((c for c in df.columns if 'reagent' in c), None)
+        min_col = next((c for c in df.columns if 'min' in c and 'vol' in c), None)
+        if not reagent_col or not min_col:
+            st.warning(
+                f"Sheet '{sheet}' missing 'Reagent Name' or 'Minimum Volume'. Skipping."
+            )
+            continue
+
+        # Clean and filter data
+        df = df[[reagent_col, min_col]].copy()
+        df[min_col] = pd.to_numeric(df[min_col], errors='coerce')
+        df.dropna(subset=[reagent_col, min_col], inplace=True)
+        df[min_col] = df[min_col].astype(int)
+        df[reagent_col] = (
+            df[reagent_col]
+              .astype(str)
+              .str.strip()
+              .str.lower()
+        )
+
+        # Build module dict
+        modules[sheet] = dict(zip(df[reagent_col], df[min_col]))
+
+    if not modules:
+        st.error("No valid sheets found in Excel file.")
+    return modules
+
+
+def select_module(modules_dict, default=None):
+    """
+    Streamlit helper to select a module (sheet) from loaded modules.
+
+    Args:
+        modules_dict (dict): { sheet_name: { reagent: min_vol } }
+        default (str, optional): default sheet to select
+
+    Returns:
+        tuple: (selected_sheet_name, min_vol_dict)
+    """
+    if not modules_dict:
+        st.error("No modules available to select.")
+        return None, {}
+
+    sheet = st.sidebar.selectbox(
+        "Select Module", options=list(modules_dict.keys()), index=(list(modules_dict.keys()).index(default) if default in modules_dict else 0)
+    )
+    return sheet, modules_dict.get(sheet, {})

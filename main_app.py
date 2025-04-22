@@ -97,7 +97,7 @@ if btn:
         st.success(f"Extracted {len(current_data)} reagents.")
 
     with col2:
-        st.write("⚖️ Comparing to minimum volumes…")
+        st.write("Comparing to minimum volumes…")
         results_df = find_reagents_to_load(current_data, min_volumes, selected_analyzer)
 
     st.divider()

@@ -93,61 +93,103 @@ def parse_e801(text):
 
 
 def parse_au5800(text):
+    """
+    Parses OCR text for Beckman AU5800 layout.
+
+    - Groups R1/R2 pairs by reagent name
+    - Takes the lower of each R1/R2 pair
+    - Sums those across sets for each reagent
+    """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    hdr_tokens = ANALYZER_HEADERS["Beckman AU5800"]
-    header_idx = None
-    for i, line in enumerate(lines):
-        cols = re.split(r"\s{2,}", line)
-        if all(any(tok.lower() in col.lower() for col in cols) for tok in hdr_tokens[:3]):
-            header_idx = i
-            headers = [c.strip() for c in cols]
-            break
+    header_idx = next((i for i, line in enumerate(lines) if "r1/r2 shots" in line.lower()), None)
     if header_idx is None:
-        st.warning("Could not locate Beckman AU5800 header.")
+        st.warning("Could not locate Beckman AU5800 header row. Check OCR output.")
         return {}
 
-    name_idx = next((i for i,h in enumerate(headers) if 'test name' in h.lower()), None)
-    shots_idx = next((i for i,h in enumerate(headers) if 'shots' in h.lower()), None)
-    on_idx = next((i for i,h in enumerate(headers) if 'onboard remaining' in h.lower()), None)
-    exp_idx = next((i for i,h in enumerate(headers) if 'expir' in h.lower()), None)
-    if None in (name_idx, shots_idx):
-        st.warning("AU5800: Required columns missing.")
-        return {}
-
-    data = {}
-    for line in lines[header_idx+1:]:
-        if any(kw in line.lower() for kw in ['total','summary']):
+    reagent_sets = {}
+    failed = []
+    for raw_line in lines[header_idx + 1:]:
+        low = raw_line.lower()
+        if any(kw in low for kw in ['total', 'summary', 'magazine', 'waste']):
             break
-        cols = re.split(r"\s{2,}", line)
-        if len(cols) <= shots_idx:
+
+        tokens = re.split(r"\s+", raw_line)
+        if len(tokens) < 8:
+            failed.append(raw_line)
             continue
-        name = cols[name_idx].strip().lower()
-        m = re.search(r"(\d+)", cols[shots_idx])
-        if not m:
+
+        # 1) Extract name from token[1], e.g. "18.gluc" → "gluc"
+        name_token = tokens[1]
+        name = name_token.split('.', 1)[1].lower() if '.' in name_token else name_token.lower()
+
+        # 2) Shots from token[3]
+        try:
+            shots = int(re.sub(r"[^\d]", "", tokens[3]))
+        except:
+            failed.append(raw_line)
             continue
-        shots = int(m.group(1))
-        onboard = cols[on_idx].strip() if on_idx is not None and on_idx < len(cols) else None
-        expiry_date = None
-        if exp_idx is not None and exp_idx < len(cols):
-            raw = cols[exp_idx].strip()
-            for fmt in ["%m/%d/%Y", "%Y-%m-%d"]:
-                try:
-                    expiry_date = datetime.strptime(raw, fmt).date()
-                    break
-                except:
-                    continue
-        entry = {"shots": shots, "expiry_date": expiry_date, "onboard_remaining": onboard}
-        if name not in data or shots < data[name]['shots']:
-            data[name] = entry
-    return data
+
+        # 3) Expiry date from token[7]
+        try:
+            expiry_date = datetime.strptime(tokens[7], "%m/%d/%Y").date()
+        except:
+            expiry_date = None
+
+        # Append this line to the list for this reagent
+        if name not in reagent_sets:
+            reagent_sets[name] = []
+        reagent_sets[name].append({
+            "line": raw_line,
+            "shots": shots,
+            "expiry_date": expiry_date
+        })
+
+    # Now group into sets of 1 or 2 and take the minimum in each pair
+    final_data = {}
+    for name, entries in reagent_sets.items():
+        entries = sorted(entries, key=lambda x: x["shots"])  # not essential, but helps visually
+        total_usable = 0
+        expiry_dates = []
+
+        # group into pairs (R1/R2 assumed to come together)
+        i = 0
+        while i < len(entries):
+            if i + 1 < len(entries):
+                # group of two
+                s1, s2 = entries[i]["shots"], entries[i + 1]["shots"]
+                min_shots = min(s1, s2)
+                expiry_dates += [entries[i]["expiry_date"], entries[i + 1]["expiry_date"]]
+                i += 2
+            else:
+                # single leftover (likely just R1 without R2)
+                min_shots = entries[i]["shots"]
+                expiry_dates.append(entries[i]["expiry_date"])
+                i += 1
+            total_usable += min_shots
+
+        # take the earliest expiry date if available
+        expiry_dates = [d for d in expiry_dates if d is not None]
+        earliest_exp = min(expiry_dates) if expiry_dates else None
+
+        final_data[name] = {
+            "shots": total_usable,
+            "expiry_date": earliest_exp,
+            "onboard_remaining": None
+        }
+
+    if failed:
+        with st.expander("⚠️ AU5800 lines skipped during parsing"):
+            for ln in failed:
+                st.text(ln)
+
+    return final_data
 
 def parse_ocr_text(text, analyzer):
-    text = text.replace('\r', '')
     if analyzer == "Roche e801":
         return parse_e801(text)
     if analyzer == "Beckman AU5800":
         return parse_au5800(text)
-
+    # Generic fallback...
     reagent_data = {}
     pattern = re.compile(r'^([A-Za-z0-9\s\-]+?)\s{2,}.*?(\d+)\s*(?:ML|Tests|units)?$', re.IGNORECASE)
     for line in text.splitlines():
@@ -161,17 +203,43 @@ def parse_ocr_text(text, analyzer):
     return reagent_data
 
 @st.cache_data(ttl=600)
-def extract_reagent_data_from_pdf(uploaded_pdf_file, analyzer):
+def extract_reagent_data_from_pdf(uploaded_pdf_file, analyzer, pages=None):
+    """
+    OCR & parse only the selected pages of the PDF.
+
+    Args:
+        uploaded_pdf_file: Streamlit UploadedFile
+        analyzer: one of ANALYZER_HEADERS.keys()
+        pages: list of 1-based page numbers to include (None = all pages)
+
+    Returns:
+        dict: parsed reagent data for that analyzer
+    """
     if uploaded_pdf_file is None:
         return None
+
     try:
         pdf_bytes = uploaded_pdf_file.getvalue()
         images = convert_from_bytes(pdf_bytes, dpi=150)
-        full_text = ''
-        for img in images:
-            full_text += pytesseract.image_to_string(img, config=tesseract_config) + '\n'
-        st.write(f"Parsing {analyzer} PDF...")
+        total_pages = len(images)
+
+        if pages:
+            indices = [p - 1 for p in pages if 1 <= p <= total_pages]
+        else:
+            indices = list(range(total_pages))
+
+        full_text = ""
+        for idx in indices:
+            img = images[idx]
+            # Auto-rotate landscape pages for AU5800
+            if analyzer == "Beckman AU5800" and img.width > img.height:
+                img = img.rotate(90, expand=True)
+            page_text = pytesseract.image_to_string(img, config=tesseract_config)
+            full_text += page_text + "\n\n"
+
+        st.write(f"Parsing {analyzer} PDF (pages {', '.join(map(str, pages or range(1,total_pages+1)))})…")
         return parse_ocr_text(full_text, analyzer)
+
     except Exception as e:
         st.error(f"Error processing PDF: {e}")
         return None

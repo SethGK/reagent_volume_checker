@@ -6,7 +6,6 @@ import re
 from datetime import datetime, date
 
 # --- Configuration ---
-# Analyzer-specific headers
 ANALYZER_HEADERS = {
     "Roche e801": [
         "Test", "Reason", "Available Tests", "Type",
@@ -19,74 +18,77 @@ ANALYZER_HEADERS = {
     ],
 }
 
-# Tesseract config (PSM 6 for uniform text)
 tesseract_config = ''
-
 
 def parse_e801(text):
     """
     Parses OCR text for Roche e801 layout.
-    Returns dict: reagent -> {
-        available: int, remaining: int, expiry_date: date or None, expiry_days: int or None
-    }
+    Strips any trailing version numbers (e.g. '-3' or ' 3') from the Test name
+    so that 'FT3-3' or 'E2 3' both map back to 'FT3' and 'E2'.
     """
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    hdr_tokens = ANALYZER_HEADERS["Roche e801"]
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    # Find the header that contains both 'Test' and 'Remaining'
     header_idx = None
-    for i, line in enumerate(lines):
-        cols = re.split(r"\s{2,}", line)
-        if all(any(tok.lower() in col.lower() for col in cols) for tok in hdr_tokens[:3]):
-            header_idx = i
-            headers = [c.strip() for c in cols]
+    for idx, line in enumerate(lines):
+        if 'test' in line.lower() and 'remaining' in line.lower():
+            header_idx = idx
             break
     if header_idx is None:
-        st.warning("Could not locate Roche e801 header.")
-        return {}
-
-    available_idx = next((i for i, h in enumerate(headers) if 'available' in h.lower()), None)
-    remaining_idx = next((i for i, h in enumerate(headers) if 'remaining' in h.lower()), None)
-    expiry_idx = next((i for i, h in enumerate(headers) if 'expiry' in h.lower()), None)
-    if available_idx is None or remaining_idx is None:
-        st.warning("Roche e801: 'Available Tests' or 'Remaining' column not found.")
+        st.warning("Could not locate Roche e801 header row. Check OCR output.")
         return {}
 
     data = {}
     for line in lines[header_idx+1:]:
-        if any(kw in line.lower() for kw in ['total', 'summary']):
+        low = line.lower()
+        # stop at summary lines
+        if any(term in low for term in ['total', 'summary', 'magazine', 'waste']):
             break
-        cols = re.split(r"\s{2,}", line)
-        if len(cols) <= max(available_idx, remaining_idx):
+
+        # Grab the Test name (with possible suffix), the Available count, then ASSAY/PRE/DIL
+        m = re.match(r"^(.+?)\s+(\d+)\s+(ASSAY|PRE|DIL)", line, re.IGNORECASE)
+        if not m:
             continue
-        name = cols[0].strip().lower()
+        raw_name, avail_str, _ = m.groups()
 
-        # parse available tests
-        avail_match = re.search(r"(\d+)", cols[available_idx])
-        available = int(avail_match.group(1)) if avail_match else None
+        # strip off any trailing '‑<digit>' or ' <digit>' so e.g. "FT3‑3" → "FT3"
+        base = re.sub(r"[-\s]\d+$", "", raw_name)
 
-        # parse remaining tests (this wedge)
-        rem_match = re.search(r"(\d+)", cols[remaining_idx])
-        remaining = int(rem_match.group(1)) if rem_match else None
+        try:
+            available = int(avail_str)
+        except:
+            available = None
 
-        # parse expiry
+        # split on whitespace
+        tokens = line.split()
+        try:
+            remaining = int(tokens[4])
+        except:
+            remaining = None
+
+        # parse expiry token (second‑to‑last) and days in parentheses (last)
         expiry_date = None
         expiry_days = None
-        if expiry_idx is not None and expiry_idx < len(cols):
-            raw = cols[expiry_idx].strip()
-            m = re.match(r"(\d{4})/(\d{2})\s*\((\d+)\)", raw)
-            if m:
-                yr, mo, days = m.groups()
+        if len(tokens) >= 2:
+            # e.g. tokens[-2] == "2025/09"
+            ym = re.match(r"(\d{4})/(\d{2})", tokens[-2])
+            if ym:
+                y, mth = ym.groups()
                 try:
-                    expiry_date = date(int(yr), int(mo), 1)
-                    expiry_days = int(days)
+                    expiry_date = date(int(y), int(mth), 1)
                 except:
                     pass
+            dm = re.search(r"\((\d+)\)", tokens[-1])
+            if dm:
+                expiry_days = int(dm.group(1))
 
-        data[name] = {
+        data[base.strip().lower()] = {
             "available": available,
             "remaining": remaining,
             "expiry_date": expiry_date,
             "expiry_days": expiry_days
         }
+
     return data
 
 
@@ -107,7 +109,7 @@ def parse_au5800(text):
     name_idx = next((i for i,h in enumerate(headers) if 'test name' in h.lower()), None)
     shots_idx = next((i for i,h in enumerate(headers) if 'shots' in h.lower()), None)
     on_idx = next((i for i,h in enumerate(headers) if 'onboard remaining' in h.lower()), None)
-    exp_idx = next((i for i,h in enumerate(headers) if 'expiration' in h.lower()), None)
+    exp_idx = next((i for i,h in enumerate(headers) if 'expir' in h.lower()), None)
     if None in (name_idx, shots_idx):
         st.warning("AU5800: Required columns missing.")
         return {}
@@ -120,8 +122,7 @@ def parse_au5800(text):
         if len(cols) <= shots_idx:
             continue
         name = cols[name_idx].strip().lower()
-        sht = cols[shots_idx].strip()
-        m = re.search(r"(\d+)", sht)
+        m = re.search(r"(\d+)", cols[shots_idx])
         if not m:
             continue
         shots = int(m.group(1))
@@ -140,14 +141,13 @@ def parse_au5800(text):
             data[name] = entry
     return data
 
-
 def parse_ocr_text(text, analyzer):
-    text = text.replace('\r','')
+    text = text.replace('\r', '')
     if analyzer == "Roche e801":
         return parse_e801(text)
     if analyzer == "Beckman AU5800":
         return parse_au5800(text)
-    # fallback
+
     reagent_data = {}
     pattern = re.compile(r'^([A-Za-z0-9\s\-]+?)\s{2,}.*?(\d+)\s*(?:ML|Tests|units)?$', re.IGNORECASE)
     for line in text.splitlines():
@@ -155,12 +155,10 @@ def parse_ocr_text(text, analyzer):
         if m:
             name = m.group(1).strip().lower()
             val = int(m.group(2))
-            if name not in reagent_data:
-                reagent_data[name] = {"volume": val, "expiry_date": None}
+            reagent_data[name] = {"volume": val, "expiry_date": None}
     if not reagent_data:
         st.warning("Could not parse reagent data generically.")
     return reagent_data
-
 
 @st.cache_data(ttl=600)
 def extract_reagent_data_from_pdf(uploaded_pdf_file, analyzer):
@@ -168,7 +166,7 @@ def extract_reagent_data_from_pdf(uploaded_pdf_file, analyzer):
         return None
     try:
         pdf_bytes = uploaded_pdf_file.getvalue()
-        images = convert_from_bytes(pdf_bytes, dpi=200)
+        images = convert_from_bytes(pdf_bytes, dpi=150)
         full_text = ''
         for img in images:
             full_text += pytesseract.image_to_string(img, config=tesseract_config) + '\n'

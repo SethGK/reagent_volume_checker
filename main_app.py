@@ -62,7 +62,7 @@ with st.sidebar:
     modules = load_min_volumes_by_module(uploaded_excel) if uploaded_excel else {}
     selected_module, min_volumes = select_module(modules) if modules else (None, {})
 
-    # If PDF, count pages and let user pick
+    # Choose pages of PDF
     page_count = 0
     selected_pages = None
     if uploaded_pdf:
@@ -85,7 +85,7 @@ if btn:
     col1, col2 = st.columns(2)
 
     with col1:
-        st.write("🔍 Extracting OCR data…")
+        st.write("Extracting OCR data…")
         current_data = extract_reagent_data_from_pdf(
             uploaded_pdf_file=uploaded_pdf,
             analyzer=selected_analyzer,
@@ -103,7 +103,7 @@ if btn:
     st.divider()
     st.subheader("Results: Reagents to Load or Expiring Soon")
 
-    # Display only the five columns requested
+    # Columns to Display
     primary_key = ANALYZER_FIELDS[selected_analyzer]["primary_field"]
     primary_col = primary_key.replace("_", " ").title()
     display_cols = [

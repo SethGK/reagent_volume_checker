@@ -70,7 +70,6 @@ def parse_e801(text):
         expiry_date = None
         expiry_days = None
         if len(tokens) >= 2:
-            # e.g. tokens[-2] == "2025/09"
             ym = re.match(r"(\d{4})/(\d{2})", tokens[-2])
             if ym:
                 y, mth = ym.groups()
@@ -90,7 +89,6 @@ def parse_e801(text):
         }
 
     return data
-
 
 def parse_au5800(text):
     """
@@ -135,7 +133,6 @@ def parse_au5800(text):
         except:
             expiry_date = None
 
-        # Append this line to the list for this reagent
         if name not in reagent_sets:
             reagent_sets[name] = []
         reagent_sets[name].append({
@@ -144,30 +141,25 @@ def parse_au5800(text):
             "expiry_date": expiry_date
         })
 
-    # Now group into sets of 1 or 2 and take the minimum in each pair
     final_data = {}
     for name, entries in reagent_sets.items():
-        entries = sorted(entries, key=lambda x: x["shots"])  # not essential, but helps visually
+        entries = sorted(entries, key=lambda x: x["shots"])
         total_usable = 0
         expiry_dates = []
 
-        # group into pairs (R1/R2 assumed to come together)
         i = 0
         while i < len(entries):
             if i + 1 < len(entries):
-                # group of two
                 s1, s2 = entries[i]["shots"], entries[i + 1]["shots"]
                 min_shots = min(s1, s2)
                 expiry_dates += [entries[i]["expiry_date"], entries[i + 1]["expiry_date"]]
                 i += 2
             else:
-                # single leftover (likely just R1 without R2)
                 min_shots = entries[i]["shots"]
                 expiry_dates.append(entries[i]["expiry_date"])
                 i += 1
             total_usable += min_shots
 
-        # take the earliest expiry date if available
         expiry_dates = [d for d in expiry_dates if d is not None]
         earliest_exp = min(expiry_dates) if expiry_dates else None
 
@@ -189,7 +181,7 @@ def parse_ocr_text(text, analyzer):
         return parse_e801(text)
     if analyzer == "Beckman AU5800":
         return parse_au5800(text)
-    # Generic fallback...
+    # Generic fallback
     reagent_data = {}
     pattern = re.compile(r'^([A-Za-z0-9\s\-]+?)\s{2,}.*?(\d+)\s*(?:ML|Tests|units)?$', re.IGNORECASE)
     for line in text.splitlines():

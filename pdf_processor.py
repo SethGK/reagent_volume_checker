@@ -93,7 +93,7 @@ def parse_e801(text):
 def parse_au5800(text):
     """
     Parses OCR text for Beckman AU5800 layout.
-
+    
     - Groups R1/R2 pairs by reagent name
     - Takes the lower of each R1/R2 pair
     - Sums those across sets for each reagent
@@ -103,36 +103,76 @@ def parse_au5800(text):
     if header_idx is None:
         st.warning("Could not locate Beckman AU5800 header row. Check OCR output.")
         return {}
-
+    
     reagent_sets = {}
     failed = []
+    no_volume_entries = []
+    
     for raw_line in lines[header_idx + 1:]:
         low = raw_line.lower()
         if any(kw in low for kw in ['total', 'summary', 'magazine', 'waste']):
             break
-
+        
+        # Check if line indicates "No volume in the Bottle"
+        if "no volume in the bottle" in low:
+            tokens = re.split(r"\s+", raw_line)
+            if len(tokens) < 2:
+                failed.append(raw_line)
+                continue
+                
+            # Extract position and reagent name
+            pos_token = tokens[0]
+            name_token = tokens[1]
+            
+            # Clean up reagent name
+            if '.' in name_token:
+                parts = name_token.split('.')
+                if len(parts) >= 2:
+                    name = parts[1].lower()
+                else:
+                    name = name_token.lower()
+            else:
+                name = name_token.lower()
+            
+            no_volume_entries.append({
+                "name": name,
+                "line": raw_line
+            })
+            continue
+        
         tokens = re.split(r"\s+", raw_line)
         if len(tokens) < 8:
             failed.append(raw_line)
             continue
-
-        # 1) Extract name from token[1], e.g. "18.gluc" → "gluc"
+        
+        # 1) Extract name from token[1], handling cases with spaces
         name_token = tokens[1]
-        name = name_token.split('.', 1)[1].lower() if '.' in name_token else name_token.lower()
-
+        # Handle cases like "12 .BUN" where there's a space
+        if '.' in name_token:
+            name = name_token.split('.', 1)[1].lower()
+        elif len(tokens) > 2 and '.' in tokens[2]:
+            name = tokens[2].split('.', 1)[1].lower()
+            # Need to shift indices for other fields
+            tokens = [tokens[0], tokens[1] + tokens[2]] + tokens[3:]
+        else:
+            name = name_token.lower()
+        
         # 2) Shots from token[3]
         try:
             shots = int(re.sub(r"[^\d]", "", tokens[3]))
         except:
             failed.append(raw_line)
             continue
-
-        # 3) Expiry date from token[7]
-        try:
-            expiry_date = datetime.strptime(tokens[7], "%m/%d/%Y").date()
-        except:
-            expiry_date = None
-
+        
+        # 3) Find expiry date - usually at position 7 or 8
+        expiry_date = None
+        for i in range(7, min(10, len(tokens))):
+            try:
+                expiry_date = datetime.strptime(tokens[i], "%m/%d/%Y").date()
+                break
+            except:
+                continue
+        
         if name not in reagent_sets:
             reagent_sets[name] = []
         reagent_sets[name].append({
@@ -140,13 +180,13 @@ def parse_au5800(text):
             "shots": shots,
             "expiry_date": expiry_date
         })
-
+    
     final_data = {}
     for name, entries in reagent_sets.items():
         entries = sorted(entries, key=lambda x: x["shots"])
         total_usable = 0
         expiry_dates = []
-
+        
         i = 0
         while i < len(entries):
             if i + 1 < len(entries):
@@ -159,21 +199,25 @@ def parse_au5800(text):
                 expiry_dates.append(entries[i]["expiry_date"])
                 i += 1
             total_usable += min_shots
-
+        
         expiry_dates = [d for d in expiry_dates if d is not None]
         earliest_exp = min(expiry_dates) if expiry_dates else None
-
+        
+        # Calculate onboard remaining from the OCR data
+        # This is a placeholder - you may need to adjust this based on your actual data
+        onboard_remaining = None
+        
         final_data[name] = {
             "shots": total_usable,
             "expiry_date": earliest_exp,
-            "onboard_remaining": None
+            "onboard_remaining": onboard_remaining
         }
-
+    
     if failed:
         with st.expander("⚠️ AU5800 lines skipped during parsing"):
             for ln in failed:
                 st.text(ln)
-
+    
     return final_data
 
 def parse_ocr_text(text, analyzer):
